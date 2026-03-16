@@ -23,6 +23,7 @@ jobs:
             docker run -d \
               --name u4129bot \
               --network s3net \
-              --env-file .env \
+              --env-file /opt/u4129bot/.env \
+              -v /opt/telegram-bot-api:/var/lib/telegram-bot-api:ro \
               --restart unless-stopped \
               u4129bot
