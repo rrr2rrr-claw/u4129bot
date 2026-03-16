@@ -1,0 +1,28 @@
+name: Deploy to clawd-slave-1
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 77.42.80.255
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/u4129bot
+            git pull origin main
+            docker build -t u4129bot .
+            docker stop u4129bot || true
+            docker rm u4129bot || true
+            docker run -d \
+              --name u4129bot \
+              --network s3net \
+              --env-file .env \
+              --restart unless-stopped \
+              u4129bot
