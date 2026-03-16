@@ -317,8 +317,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/"):
         return
 
-    # (d) Telegram username/link → ID lookup
-    if text.startswith("@") or "t.me/" in text:
+    # (b) Detect HTML or Markdown in plain text → render preview (BEFORE link checks)
+    html_tag_re = re.compile(r'<(b|i|u|s|code|pre|a |tg-spoiler|tg-emoji|blockquote)[>\s/]', re.IGNORECASE)
+    md_pattern_re = re.compile(r'(\*\*.+?\*\*|\*[^*]+\*|`.+?`|~~.+?~~|\[.+?\]\(.+?\))')
+
+    if html_tag_re.search(text):
+        try:
+            await message.reply_text(text, parse_mode="HTML")
+        except Exception as e:
+            await message.reply_text(f"❌ HTML parse error: {e}")
+        return
+
+    if md_pattern_re.search(text):
+        try:
+            await message.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await message.reply_text(f"❌ Markdown parse error: {e}")
+        return
+
+    # (d) Telegram username/link → ID lookup (only short messages like "@username")
+    if text.startswith("@") or (text.startswith("http") and "t.me/" in text and len(text) < 200):
         target = text
         # Extract username
         m = re.search(r't\.me/([A-Za-z0-9_]+)', target)
@@ -347,8 +365,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(f"❌ Не удалось получить info: {e}")
         return
 
-    # (b) Formatted text → 3 files
-    if has_formatting(entities):
+    # (b) Formatted text → 3 files (but NOT if text contains literal HTML/MD tags — that's preview mode)
+    html_tag_check = re.compile(r'<(b|i|u|s|code|pre|a |tg-spoiler|tg-emoji|blockquote)[>\s/]', re.IGNORECASE)
+    if has_formatting(entities) and not html_tag_check.search(text):
         html = entities_to_html(text, entities)
         mdv2 = entities_to_mdv2(text, entities)
         md = entities_to_markdown(text, entities)
@@ -388,32 +407,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("\n".join(results))
         return
 
-    # (f) Detect HTML or Markdown in plain text → render preview
-    # HTML detection: contains common Telegram HTML tags
-    html_re = re.compile(r'<(b|i|u|s|code|pre|a |tg-spoiler|tg-emoji|blockquote)[>\s]', re.IGNORECASE)
-    # Markdown detection: **bold**, *italic*, `code`, ```pre```, ~~strike~~, [link](url)
-    md_re = re.compile(r'(\*\*.+?\*\*|\*[^*]+\*|`.+?`|~~.+?~~|\[.+?\]\(.+?\))')
-
-    if html_re.search(text):
-        try:
-            await message.reply_text(text, parse_mode="HTML")
-            return
-        except Exception as e:
-            await message.reply_text(f"❌ HTML parse error: {e}")
-            return
-
-    if md_re.search(text):
-        try:
-            await message.reply_text(text, parse_mode="Markdown")
-            return
-        except Exception as e:
-            await message.reply_text(f"❌ Markdown parse error: {e}")
-            return
-
-    # Truly plain text → help
+    # Plain text → help
     await message.reply_text(
         "💡 Отправь файл, форматированный текст, @username, ссылку t.me/ или любую ссылку.",
     )
+
+
+
 
 
 async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
