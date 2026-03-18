@@ -5,6 +5,7 @@ import uuid
 import boto3
 import httpx
 from io import BytesIO
+from openai import OpenAI
 from telegram import Update, ChatMemberUpdated
 from telegram.ext import (
     Application, MessageHandler, ChatMemberHandler,
@@ -22,6 +23,12 @@ S3_ACCESS_KEY = os.environ["S3_ACCESS_KEY"]
 S3_SECRET_KEY = os.environ["S3_SECRET_KEY"]
 LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "http://localhost:8081/bot")
 DUB_API_KEY = os.environ["DUB_API_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+# Allowed user IDs (comma-separated). Empty = allow all.
+ALLOWED_USERS = set(map(int, filter(None, os.environ.get("ALLOWED_USERS", "").split(","))))
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 s3 = boto3.client(
     "s3",
@@ -31,6 +38,15 @@ s3 = boto3.client(
 )
 
 URL_RE = re.compile(r'https?://[^\s<>\"\']+')
+
+# ─── Access control ───
+
+def is_allowed(update: Update) -> bool:
+    """Check if the user is in the allowed list."""
+    if not ALLOWED_USERS:
+        return True
+    user = update.effective_user
+    return user is not None and user.id in ALLOWED_USERS
 
 # ─── Helpers ───
 
@@ -54,7 +70,6 @@ def entities_to_html(text: str, entities) -> str:
     for ent in sorted_ents:
         start = ent.offset * 2
         end = (ent.offset + ent.length) * 2
-        # text before this entity
         pieces.append(_escape_html(utf16[last:start].decode("utf-16-le")))
         inner = _escape_html(utf16[start:end].decode("utf-16-le"))
 
@@ -212,22 +227,84 @@ def entities_to_markdown(text: str, entities) -> str:
     return "".join(pieces)
 
 
+# ─── Whisper transcription ───
+
+async def transcribe_voice(file_data: bytes, file_name: str = "voice.ogg") -> str:
+    """Transcribe audio using OpenAI Whisper API."""
+    transcript = openai_client.audio.transcriptions.create(
+        model="whisper-1",
+        file=(file_name, BytesIO(file_data)),
+    )
+    return transcript.text
+
+
 # ─── Handlers ───
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
     await update.message.reply_text(
         "👋 <b>u4129bot</b>\n\n"
         "📎 Отправь файл → загрузка в S3\n"
         "✨ Форматированный текст → 3 файла (HTML, MD, TG MD)\n"
         "🔍 @username или t.me/link → ID lookup\n"
-        "🔗 Ссылка → сокращение через dub.sh",
+        "🔗 Ссылка → сокращение через dub.sh\n"
+        "🎤 Голосовое → расшифровка через Whisper",
         parse_mode="HTML",
     )
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages — transcribe with Whisper."""
+    if not is_allowed(update):
+        return
+
+    message = update.message
+    if not message or not message.voice:
+        return
+
+    try:
+        voice = message.voice
+        tg_file = await voice.get_file(read_timeout=300, write_timeout=300, connect_timeout=60)
+        file_path = tg_file.file_path
+
+        if file_path.startswith("/"):
+            with open(file_path, "rb") as f:
+                data = f.read()
+        else:
+            data = bytes(await tg_file.download_as_bytearray(
+                read_timeout=300, write_timeout=300, connect_timeout=60
+            ))
+
+        duration = voice.duration or 0
+        size_kb = len(data) / 1024
+
+        await message.reply_text("🎤 Расшифровываю...")
+
+        text = await transcribe_voice(data)
+
+        duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "?"
+        await message.reply_text(
+            f"🎤 <b>Расшифровка</b> ({duration_str}, {size_kb:.0f} KB)\n\n{text}",
+            parse_mode="HTML",
+        )
+        logger.info(f"Transcribed voice ({duration}s, {len(data)} bytes)")
+
+    except Exception as e:
+        logger.error(f"Voice transcription error: {e}")
+        await message.reply_text(f"❌ Ошибка расшифровки: {e}")
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
     message = update.message
     if not message:
+        return
+
+    # Voice messages are handled separately by handle_voice
+    if message.voice:
         return
 
     file_obj = None
@@ -245,9 +322,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif message.audio:
         file_obj = message.audio
         file_name = file_obj.file_name or f"audio_{file_obj.file_unique_id}.mp3"
-    elif message.voice:
-        file_obj = message.voice
-        file_name = f"voice_{file_obj.file_unique_id}.ogg"
     elif message.video_note:
         file_obj = message.video_note
         file_name = f"videonote_{file_obj.file_unique_id}.mp4"
@@ -306,6 +380,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
     message = update.message
     if not message or not message.text:
         return
@@ -338,7 +415,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (d) Telegram username/link → ID lookup (only short messages like "@username")
     if text.startswith("@") or (text.startswith("http") and "t.me/" in text and len(text) < 200):
         target = text
-        # Extract username
         m = re.search(r't\.me/([A-Za-z0-9_]+)', target)
         if m:
             username = "@" + m.group(1)
@@ -365,7 +441,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(f"❌ Не удалось получить info: {e}")
         return
 
-    # (b) Formatted text → 3 files (but NOT if text contains literal HTML/MD tags — that's preview mode)
+    # (b) Formatted text → 3 files
     html_tag_check = re.compile(r'<(b|i|u|s|code|pre|a |tg-spoiler|tg-emoji|blockquote)[>\s/]', re.IGNORECASE)
     if has_formatting(entities) and not html_tag_check.search(text):
         html = entities_to_html(text, entities)
@@ -413,9 +489,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-
-
-
 async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """When bot is added to a group/channel, send info."""
     result = update.my_chat_member
@@ -426,7 +499,6 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if new.user.id != context.bot.id:
         return
 
-    # Bot was added (member/admin) vs removed
     if new.status in ("member", "administrator"):
         chat = result.chat
         lines = [
@@ -459,15 +531,17 @@ def main():
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("help", handle_start))
     app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    # Voice handler BEFORE generic file handler
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO |
-        filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE |
+        filters.AUDIO | filters.VIDEO_NOTE |
         filters.Sticker.ALL | filters.ANIMATION,
         handle_file,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("u4129bot started")
+    logger.info("u4129bot started (allowed users: %s)", ALLOWED_USERS or "all")
     app.run_polling(
         allowed_updates=["message", "my_chat_member"],
         read_timeout=300, write_timeout=300, connect_timeout=60,
