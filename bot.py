@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import uuid
+import sqlite3
+from datetime import datetime, timezone
 import boto3
 import httpx
 from io import BytesIO
@@ -24,9 +26,12 @@ S3_SECRET_KEY = os.environ["S3_SECRET_KEY"]
 LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "http://localhost:8081/bot")
 DUB_API_KEY = os.environ["DUB_API_KEY"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "")
 
-# Allowed user IDs (comma-separated). Empty = allow all.
-ALLOWED_USERS = set(map(int, filter(None, os.environ.get("ALLOWED_USERS", "").split(","))))
+# Seed users who don't need a password (comma-separated IDs)
+SEED_USERS = set(map(int, filter(None, os.environ.get("SEED_USERS", "").split(","))))
+
+DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -39,14 +44,127 @@ s3 = boto3.client(
 
 URL_RE = re.compile(r'https?://[^\s<>\"\']+')
 
+
+# ─── Database ───
+
+def init_db():
+    """Initialize SQLite database."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            language_code TEXT,
+            is_premium INTEGER DEFAULT 0,
+            is_bot INTEGER DEFAULT 0,
+            authorized INTEGER DEFAULT 0,
+            authorized_at TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    # Seed users
+    now = datetime.now(timezone.utc).isoformat()
+    for uid in SEED_USERS:
+        conn.execute("""
+            INSERT OR IGNORE INTO users (user_id, authorized, authorized_at, first_seen_at, last_seen_at)
+            VALUES (?, 1, ?, ?, ?)
+        """, (uid, now, now, now))
+    conn.commit()
+    conn.close()
+    logger.info(f"Database initialized at {DB_PATH}, seed users: {SEED_USERS}")
+
+
+def upsert_user(user) -> bool:
+    """Update or insert user info. Returns True if authorized."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("SELECT authorized FROM users WHERE user_id = ?", (user.id,))
+    row = cur.fetchone()
+
+    if row is None:
+        # New user
+        cur.execute("""
+            INSERT INTO users (user_id, username, first_name, last_name, language_code, is_premium, is_bot, authorized, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            user.language_code,
+            1 if getattr(user, 'is_premium', False) else 0,
+            1 if user.is_bot else 0,
+            now, now,
+        ))
+        conn.commit()
+        conn.close()
+        return False
+    else:
+        # Update existing user info
+        cur.execute("""
+            UPDATE users SET
+                username = ?,
+                first_name = ?,
+                last_name = ?,
+                language_code = ?,
+                is_premium = ?,
+                is_bot = ?,
+                last_seen_at = ?
+            WHERE user_id = ?
+        """, (
+            user.username,
+            user.first_name,
+            user.last_name,
+            user.language_code,
+            1 if getattr(user, 'is_premium', False) else 0,
+            1 if user.is_bot else 0,
+            now,
+            user.id,
+        ))
+        conn.commit()
+        authorized = row[0] == 1
+        conn.close()
+        return authorized
+
+
+def authorize_user(user_id: int):
+    """Mark user as authorized."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE users SET authorized = 1, authorized_at = ? WHERE user_id = ?", (now, user_id))
+    conn.commit()
+    conn.close()
+
+
+def is_user_authorized(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT authorized FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None and row[0] == 1
+
+
 # ─── Access control ───
 
-def is_allowed(update: Update) -> bool:
-    """Check if the user is in the allowed list."""
-    if not ALLOWED_USERS:
-        return True
+def check_access(update: Update) -> str:
+    """Check user access. Returns 'ok', 'need_password', or 'new'."""
     user = update.effective_user
-    return user is not None and user.id in ALLOWED_USERS
+    if not user:
+        return "new"
+
+    authorized = upsert_user(user)
+    if authorized:
+        return "ok"
+    return "need_password"
+
 
 # ─── Helpers ───
 
@@ -241,8 +359,13 @@ async def transcribe_voice(file_data: bytes, file_name: str = "voice.ogg") -> st
 # ─── Handlers ───
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
+    access = check_access(update)
+    if access == "need_password":
+        await update.message.reply_text(
+            "🔐 Для доступа к боту введите пароль:",
+        )
         return
+
     await update.message.reply_text(
         "👋 <b>u4129bot</b>\n\n"
         "📎 Отправь файл → загрузка в S3\n"
@@ -256,7 +379,9 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle voice messages — transcribe with Whisper."""
-    if not is_allowed(update):
+    access = check_access(update)
+    if access == "need_password":
+        await update.message.reply_text("🔐 Для доступа к боту введите пароль:")
         return
 
     message = update.message
@@ -296,7 +421,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
+    access = check_access(update)
+    if access == "need_password":
+        await update.message.reply_text("🔐 Для доступа к боту введите пароль:")
         return
 
     message = update.message
@@ -380,14 +507,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
     message = update.message
     if not message or not message.text:
         return
 
     text = message.text.strip()
+    user = update.effective_user
+
+    # Check if this is a password attempt from unauthorized user
+    if user and not is_user_authorized(user.id):
+        # Record the user visit
+        upsert_user(user)
+
+        if BOT_PASSWORD and text == BOT_PASSWORD:
+            authorize_user(user.id)
+            await message.reply_text(
+                "✅ Пароль принят! Добро пожаловать.\n\n"
+                "Нажми /start чтобы увидеть возможности бота.",
+            )
+            logger.info(f"User {user.id} (@{user.username}) authorized with password")
+            return
+        elif BOT_PASSWORD:
+            await message.reply_text("🔐 Для доступа к боту введите пароль:")
+            return
+        # If no password set, allow all
+        if not BOT_PASSWORD:
+            pass
+        else:
+            return
+
     entities = message.entities or []
 
     # Skip commands
@@ -516,6 +664,8 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def main():
+    init_db()
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -541,7 +691,7 @@ def main():
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("u4129bot started (allowed users: %s)", ALLOWED_USERS or "all")
+    logger.info("u4129bot started (seed users: %s)", SEED_USERS or "none")
     app.run_polling(
         allowed_updates=["message", "my_chat_member"],
         read_timeout=300, write_timeout=300, connect_timeout=60,

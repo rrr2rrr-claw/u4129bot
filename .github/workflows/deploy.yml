@@ -25,5 +25,6 @@ jobs:
               --network s3net \
               --env-file /opt/u4129bot/.env \
               -v /opt/telegram-bot-api:/var/lib/telegram-bot-api:ro \
+              -v /opt/u4129bot-data:/data \
               --restart unless-stopped \
               u4129bot
