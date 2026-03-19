@@ -169,10 +169,11 @@ def check_access(update: Update) -> str:
 # ─── Helpers ───
 
 def has_formatting(entities):
-    """Check if there's at least one non-bot_command entity."""
+    """Check if there's at least one meaningful formatting entity."""
     if not entities:
         return False
-    return any(e.type != "bot_command" for e in entities)
+    skip = {"bot_command", "url", "email", "phone_number", "mention", "hashtag", "cashtag"}
+    return any(e.type not in skip for e in entities)
 
 
 def entities_to_html(text: str, entities) -> str:
